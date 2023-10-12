@@ -22,130 +22,157 @@ namespace RotaApiArge.Controller
 
 		public RotaController(IMemoryCache cache)
 		{
-			_cache = cache;
-			_routerDb = new RouterDb();
-
-			using (var stream = new FileStream(OSM_PATH, FileMode.Open, FileAccess.Read))
+			_cache = cache;  // Önbellek referansını sınıf değişkenine atar
+			_routerDb = _cache.GetOrCreate("RouterDb", entry =>  // "RouterDb" anahtarını kullanarak önbellekte bir RouterDb nesnesi arar veya oluşturur
 			{
-				_routerDb.LoadOsmData(stream, Vehicle.Car);
-			}
+				entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(24);  // Önbellekteki öğenin geçerliliği 24 saat olarak ayarlanır
+				RouterDb routerDb = new RouterDb();  // Yeni bir RouterDb nesnesi oluşturur
+				using (var stream = new FileStream(OSM_PATH, FileMode.Open, FileAccess.Read))  // OSM veri dosyasını okumak için bir dosya akışı oluşturur
+				{
+					routerDb.LoadOsmData(stream, Vehicle.Car);  // OSM verilerini RouterDb nesnesine yükler
+				}
+				return routerDb;  // RouterDb nesnesini döndürür, böylece önbellekte saklanabilir
+			});
 		}
 
+
+
 		[HttpGet]
-		public async Task<IActionResult> GetRoute()
+		public IActionResult GetRoute()
 		{
+			// Yeni bir Stopwatch nesnesi oluşturur, bu kodun çalışma süresini ölçmek için kullanılacaktır.
 			Stopwatch Tim = new Stopwatch();
-			
+
+			// Başlangıç ve bitiş koordinatlarını tanımlar
 			Coordinate START_COORDINATE = new Coordinate(41.0484f, 29.0537f);
 			Coordinate END_COORDINATE = new Coordinate(41.0799f, 29.0690f);
 
 			try
 			{
+				// Önbellekte 'RouteOrder' anahtarı altında bir değer olup olmadığını kontrol eder.
+				// Eğer varsa, bu değeri 'routeOrderCoordinates' değişkenine atar.
 				if (!_cache.TryGetValue("RouteOrder", out List<CoordinateModel> routeOrderCoordinates))
 				{
-					// JSON dosyasından veriyi oku ve dönüştür
-					string json = await System.IO.File.ReadAllTextAsync(JSON_PATH);
+					// JSON dosyasını okur ve içeriğini bir string'e dönüştürür.
+					string json = System.IO.File.ReadAllText(JSON_PATH);
+					// JSON string'ini bir FeatureCollection nesnesine dönüştürür.
 					var featureCollection = JsonConvert.DeserializeObject<FeatureCollection>(json);
 
-					// Koordinat listesi oluştur
+					// Koordinat listesi oluşturur ve başlangıç koordinatını listeye ekler
 					List<Coordinate> coordinates = new List<Coordinate> { START_COORDINATE };
+					// FeatureCollection'daki her özelliği (feature) döngüsü ile işler ve koordinatları listeye ekler
 					foreach (var feature in featureCollection.features)
 					{
 						float lat = feature.geometry.coordinates[1];
 						float lon = feature.geometry.coordinates[0];
 						coordinates.Add(new Coordinate(lat, lon));
 					}
+					// Bitiş koordinatını listeye ekler
 					coordinates.Add(END_COORDINATE);
 
-					// Mesafeleri hesapla
+					// Mesafe matrisini başlatır, bu matris koordinatlar arasındaki mesafeleri saklayacaktır.
 					float[,] distances = new float[coordinates.Count, coordinates.Count];
-					var router = new ItineroRouter(_routerDb); // Use the pre-loaded RouterDb.
+					// Önceden yüklenmiş RouterDb'yi kullanarak yeni bir router nesnesi oluşturur.
+					var router = new ItineroRouter(_routerDb);
+					// Zamanlayıcıyı başlatır
 					Tim.Start();
-					await Task.Run(() =>
+
+					// Koordinatlar listesindeki her koordinat için döngü başlatır
+					for (int i = 0; i < coordinates.Count; i++)
 					{
-						for (int i = 0; i < coordinates.Count; i++)
+						// İlk koordinatı çözümleyerek bir router nesnesi oluşturur
+						var resolved1 = router.Resolve(Vehicle.Car.Shortest(), coordinates[i], SEARCH_DISTANCE);
+						// Eğer koordinat çözümlenemezse, hatayı konsola yazar ve bir sonraki iterasyona geçer
+						if (resolved1 == null)
 						{
-							var resolved1 = router.Resolve(Vehicle.Car.Shortest(), coordinates[i], SEARCH_DISTANCE);
-							if (resolved1 == null)
+							Console.WriteLine($"Failed to resolve point at coordinates {coordinates[i].Latitude}, {coordinates[i].Longitude}");
+							continue;
+						}
+
+						// İkinci koordinatı çözümleyerek bir router nesnesi oluşturur
+						for (int j = i + 1; j < coordinates.Count; j++)
+						{
+							var resolved2 = router.Resolve(Vehicle.Car.Shortest(), coordinates[j], SEARCH_DISTANCE);
+							// Eğer koordinat çözümlenemezse, hatayı konsola yazar ve bir sonraki iterasyona geçer
+							if (resolved2 == null)
 							{
-								Console.WriteLine($"Failed to resolve point at coordinates {coordinates[i].Latitude}, {coordinates[i].Longitude}");
+								Console.WriteLine($"Failed to resolve point at coordinates {coordinates[j].Latitude}, {coordinates[j].Longitude}");
 								continue;
 							}
 
-							for (int j = i + 1; j < coordinates.Count; j++)
-							{
-								var resolved2 = router.Resolve(Vehicle.Car.Shortest(), coordinates[j], SEARCH_DISTANCE);
-								if (resolved2 == null)
-								{
-									Console.WriteLine($"Failed to resolve point at coordinates {coordinates[j].Latitude}, {coordinates[j].Longitude}");
-									continue;
-								}
+							// İki koordinat arasındaki rotayı hesaplar
+							var route = router.Calculate(Vehicle.Car.Shortest(), resolved1, resolved2);
 
-								var route = router.Calculate(Vehicle.Car.Shortest(), resolved1, resolved2);
-
-
-								distances[i, j] = route.TotalDistance;
-								distances[j, i] = route.TotalDistance;
-							}
-
-
+							// Hesaplanan mesafeyi mesafe matrisine ekler
+							distances[i, j] = route.TotalDistance;
+							distances[j, i] = route.TotalDistance;
 						}
-					});
-					
-					
-					// Rota sırasını belirle
-					
-					
-					routeOrderCoordinates =await DetermineRouteOrderAsync(coordinates, distances);
+					}
+					// Rota sırasını belirlemek için asenkron bir işlem başlatır
+					routeOrderCoordinates = DetermineRouteOrderAsync(coordinates, distances);
+					// Zamanlayıcıyı durdurur ve geçen toplam süreyi konsola yazar
 					Tim.Stop();
 					Console.WriteLine(Tim.Elapsed.TotalSeconds);
-					//_cache.Set("RouteOrder", routeOrderCoordinates, TimeSpan.FromHours(1)); // 1 saat boyunca cache'de sakla
 				}
 
+				// Rota sırası koordinatlarını döndürür
 				return Ok(routeOrderCoordinates);
 			}
 			catch (Exception ex)
 			{
+				// Herhangi bir hata durumunda hatayı konsola yazar ve bir BadRequest yanıtı döndürür
 				Console.WriteLine(ex.Message);
 				Console.WriteLine(ex.StackTrace);
 				return BadRequest(ex.Message);
 			}
 		}
 
-		private async Task<List<CoordinateModel>> DetermineRouteOrderAsync(List<Coordinate> coordinates, float[,] distances)
+
+		private List<CoordinateModel> DetermineRouteOrderAsync(List<Coordinate> coordinates, float[,] distances)
 		{
-			return await Task.Run(() =>
+			// Rota sırasındaki koordinatları saklamak için yeni bir CoordinateModel listesi oluşturur
+			List<CoordinateModel> routeOrderCoordinates = new List<CoordinateModel>();
+			// Ziyaret edilmemiş düğümleri temsil etmek için bir hash set oluşturur. Başlangıçta tüm düğümler ziyaret edilmemiştir.
+			HashSet<int> unvisited = new HashSet<int>(Enumerable.Range(0, coordinates.Count));
+
+			int current = 0; // Başlangıç noktasını temsil eder (0. indeks)
+							 // Başlangıç koordinatını rota sırası listesine ekler
+			routeOrderCoordinates.Add(new CoordinateModel { x = coordinates[current].Longitude, y = coordinates[current].Latitude });
+			// Başlangıç düğümünü ziyaret edilmiş olarak işaretler ve unvisited setinden kaldırır
+			unvisited.Remove(current);
+
+			// Tüm düğümler ziyaret edilene kadar döngüyü sürdürür
+			while (unvisited.Count > 0)
 			{
-				List<CoordinateModel> routeOrderCoordinates = new List<CoordinateModel>();
-				HashSet<int> unvisited = new HashSet<int>(Enumerable.Range(0, coordinates.Count));
+				// En yakın düğümü bulmak için başlangıç değerlerini belirler
+				float closestDistance = float.MaxValue;
+				int closestNode = -1;
 
-				int current = 0; // Başlangıç noktası (0. indeks)
-				routeOrderCoordinates.Add(new CoordinateModel { x = coordinates[current].Longitude, y = coordinates[current].Latitude });
-				unvisited.Remove(current);
-
-				while (unvisited.Count > 0)
+				// Ziyaret edilmemiş her düğüm için döngüyü çalıştırır
+				foreach (int i in unvisited)
 				{
-					float closestDistance = float.MaxValue;
-					int closestNode = -1;
-
-					foreach (int i in unvisited)
+					// Eğer bulunan mesafe, şu ana kadar bulunan en kısa mesafeden daha küçükse, en yakın düğümü ve mesafeyi günceller
+					if (distances[current, i] < closestDistance)
 					{
-						if (distances[current, i] < closestDistance)
-						{
-							closestDistance = distances[current, i];
-							closestNode = i;
-						}
+						closestDistance = distances[current, i];
+						closestNode = i;
 					}
-
-					current = closestNode;
-					unvisited.Remove(current);
-					routeOrderCoordinates.Add(new CoordinateModel { x = coordinates[current].Longitude, y = coordinates[current].Latitude });
 				}
 
-				return routeOrderCoordinates;
-			});
-		}
+				// En yakın düğümü mevcut düğüm olarak günceller ve ziyaret edilmiş olarak işaretler
+				current = closestNode;
+				unvisited.Remove(current);
+				// Mevcut düğümün koordinatlarını rota sırası listesine ekler
+				routeOrderCoordinates.Add(new CoordinateModel
+				{
+					x = coordinates[current].Longitude,
+					y = coordinates[current].Latitude
+				});
+			}
 
+			// Rota sırasındaki koordinatları döndürür
+			return routeOrderCoordinates;
+		}
 
 
 	}
